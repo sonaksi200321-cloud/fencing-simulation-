@@ -1,0 +1,579 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Interactive Fencing Model 2</title>
+<style>
+body {
+font-family: 'Times New Roman', serif;
+margin: 20px;
+background-color: #f8f9fa;
+}
+.container {
+max-width: 800px;
+margin: 0 auto;
+background: white;
+padding: 30px;
+border-radius: 10px;
+box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+h1 {
+text-align: center;
+color: #2c3e50;
+margin-bottom: 30px;
+font-size: 24px;
+}
+.diagram-container {
+display: flex;
+justify-content: center;
+margin: 20px 0;
+}
+svg {
+border: 1px solid #bdc3c7;
+background-color: white;
+border-radius: 5px;
+}
+.controls {
+margin-top: 30px;
+padding: 20px;
+background-color: #f1f2f6;
+border-radius: 8px;
+text-align: center;
+}
+.control-row {
+margin-bottom: 15px;
+}
+.control-row label {
+font-weight: bold;
+margin-right: 10px;
+}
+.control-row input[type="range"] {
+margin: 0 10px;
+width: 200px;
+}
+.download-section {
+text-align: center;
+margin: 30px 0;
+padding: 20px;
+background-color: #e8f5e8;
+border-radius: 8px;
+border: 2px solid #27ae60;
+}
+.download-btn {
+background-color: #27ae60;
+color: white;
+padding: 12px 24px;
+border: none;
+border-radius: 5px;
+font-size: 16px;
+cursor: pointer;
+transition: background-color 0.3s;
+}
+.download-btn:hover {
+background-color: #229954;
+}
+.legend {
+margin-top: 15px;
+padding: 15px;
+background-color: #ffffff;
+border-radius: 5px;
+font-size: 14px;
+border: 1px solid #ddd;
+}
+.legend-item {
+margin: 8px 0;
+}
+.color-box {
+display: inline-block;
+width: 20px;
+height: 15px;
+margin-right: 8px;
+vertical-align: middle;
+border: 1px solid #333;
+}
+.formula {
+background-color: #f8f9fa;
+padding: 10px;
+border-radius: 5px;
+margin: 10px 0;
+border-left: 4px solid #3498db;
+}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div class="container">
+<h1>Interactive Fencing Model 2: Realistic Lunge with Torso Lean</h1>
+
+<div class="download-section">
+<h3>Download This Simulation</h3>
+<p>Click below to download this interactive fencing simulation:</p>
+<button class="download-btn" onclick="downloadHTML()">📥 Download HTML File</button>
+<p style="font-size: 12px; color: #666; margin-top: 10px;">
+The downloaded file works offline in any web browser.
+</p>
+</div>
+
+<div class="controls">
+<div class="control-row">
+<label for="angleSlider">Angle of Attack (θ):</label>
+<input type="range" id="angleSlider" min="0" max="90" value="70">
+<span id="angleValue">70°</span>
+</div>
+<div class="control-row">
+<span style="font-weight: bold; color: #e74c3c;">Current Reach: </span>
+<span id="reachValue" style="font-size: 18px; color: #e74c3c;">154.8 cm</span>
+</div>
+</div>
+
+<div class="diagram-container">
+<svg id="interactiveDiagram" width="500" height="400" viewBox="0 0 500 400">
+<!-- Grid lines -->
+<defs>
+<pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
+<path d="M 20 0 L 0 0 0 20" fill="none" stroke="#e0e0e0" stroke-width="0.5"></path>
+</pattern>
+<marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+<polygon points="0 0, 10 3.5, 0 7" fill="black"></polygon>
+</marker>
+</defs>
+<rect width="100%" height="100%" fill="url(#grid)"></rect>
+
+<!-- Coordinate axes -->
+<line x1="60" y1="350" x2="450" y2="350" stroke="black" stroke-width="2" marker-end="url(#arrowhead)"></line>
+<line x1="60" y1="350" x2="60" y2="50" stroke="black" stroke-width="2" marker-end="url(#arrowhead)"></line>
+
+<!-- Hip point H(0,0) -->
+<circle cx="60" cy="350" r="5" fill="red"></circle>
+<text x="35" y="370" font-size="14" fill="red" font-weight="bold">H(0,0)</text>
+
+<!-- Vertical reference line (dashed) -->
+<line x1="60" y1="350" x2="60" y2="240" stroke="gray" stroke-width="1" stroke-dasharray="5,5"></line>
+
+<!-- Leaning torso (fixed) -->
+<line id="torso" x1="60" y1="350" x2="79" y2="298" stroke="blue" stroke-width="6"></line>
+<text x="25" y="325" font-size="12" fill="blue" font-weight="bold">t = 55cm</text>
+
+<!-- Torso lean angle α -->
+<path d="M 60 330 A 20 20 0 0 1 68 313" stroke="green" stroke-width="3" fill="none"></path>
+<text x="75" y="325" font-size="14" fill="green" font-weight="bold">α = 20°</text>
+
+<!-- Shoulder point S -->
+<circle cx="79" cy="298" r="4" fill="green"></circle>
+<text x="85" y="295" font-size="12" fill="green" font-weight="bold">S</text>
+
+<!-- Dynamic arm/sword segment -->
+<line id="armSegment" x1="79" y1="298" x2="447.02776970727945" y2="220.7922646419376" stroke="orange" stroke-width="6"></line>
+<text id="armLabel" x="150" y="310" font-size="12" fill="orange" font-weight="bold">L = 136cm</text>
+
+<!-- Angle θ from torso -->
+<path id="angleArc" d="M 107.02776970727945 202.7922646419376 A 18 18 0 0 1 123.9422368814258 214.63590206207556" stroke="red" stroke-width="3" fill="none"></path>
+<text id="angleText" x="128.9422368814258" y="209.63590206207556" font-size="14" fill="red" font-weight="bold">θ</text>
+
+<!-- Dynamic sword tip -->
+<circle id="swordTip" cx="447.02776970727945" cy="220.7922646419376" r="4" fill="purple"></circle>
+<text id="tipLabel" x="245" y="335" font-size="12" fill="purple" font-weight="bold">Sword Tip</text>
+
+<!-- Dynamic horizontal reach line -->
+<line id="reachLine" x1="60" y1="350" x2="447.02776970727945" y2="350" stroke="purple" stroke-width="4" stroke-dasharray="8,4"></line>
+<text id="reachLabel" x="150" y="370" font-size="14" fill="purple" font-weight="bold">R = Total Reach</text>
+
+<!-- Shoulder horizontal component -->
+<line x1="60" y1="350" x2="79" y2="350" stroke="green" stroke-width="2" stroke-dasharray="3,3"></line>
+<text x="65" y="340" font-size="10" fill="green">t·sin(α)</text>
+
+<!-- Arm horizontal component -->
+<line id="armHorizontal" x1="79" y1="350" x2="447.02776970727945" y2="350" stroke="orange" stroke-width="2" stroke-dasharray="3,3"></line>
+<text id="armHorizontalLabel" x="140" y="340" font-size="10" fill="orange">L·sin(α+θ)</text>
+
+<!-- Right angle indicators -->
+<path id="rightAngle" d="M 437.02776970727945 220.7922646419376 L 437.02776970727945 350 L 447.02776970727945 350" stroke="gray" stroke-width="1" fill="none"></path>
+
+<!-- Axis labels -->
+<text x="460" y="355" font-size="14" fill="black" font-weight="bold">x (cm)</text>
+<text x="65" y="45" font-size="14" fill="black" font-weight="bold">y (cm)</text>
+</svg>
+</div>
+
+<div class="legend">
+<div class="legend-item"><span class="color-box" style="background-color: red;"></span>Hip (Origin Point)</div>
+<div class="legend-item"><span class="color-box" style="background-color: blue;"></span>Leaning Torso (t = 55cm)</div>
+<div class="legend-item"><span class="color-box" style="background-color: green;"></span>Shoulder &amp; Lean Angle (α = 20°)</div>
+<div class="legend-item"><span class="color-box" style="background-color: orange;"></span>Arm + Sword (L = 136cm)</div>
+<div class="legend-item"><span class="color-box" style="background-color: purple;"></span>Total Horizontal Reach (R)</div>
+</div>
+
+<div class="formula">
+<div style="font-weight: bold; margin-bottom: 8px;">Mathematical Model:</div>
+<div>R(θ) = t·sin(α) + L·sin(α + θ)</div>
+<div>R(θ) = 55·sin(20°) + 136·sin(20° + θ)</div>
+<div>R(θ) = 18.81 + 136·sin(20° + θ)</div>
+<div style="color: #e74c3c; font-weight: bold; margin-top: 8px;">
+Optimal: θ = 70°, R_max ≈ 154.8cm
+</div>
+</div>
+
+</div>
+
+<script>
+const slider = document.getElementById('angleSlider');
+const angleValueSpan = document.getElementById('angleValue');
+const reachValueSpan = document.getElementById('reachValue');
+const armSegment = document.getElementById('armSegment');
+const swordTip = document.getElementById('swordTip');
+const reachLine = document.getElementById('reachLine');
+const angleArc = document.getElementById('angleArc');
+const angleText = document.getElementById('angleText');
+const rightAngle = document.getElementById('rightAngle');
+const armHorizontal = document.getElementById('armHorizontal');
+
+// Constants
+const t = 55; // torso length in cm
+const L = 136; // arm + sword length in cm
+const alpha = 20; // torso lean angle in degrees
+const scale = 2.5; // pixels per cm for visualization
+
+// Shoulder position (fixed)
+const shoulderX = 60 + t * Math.sin(alpha * Math.PI / 180) * scale;
+const shoulderY = 350 - t * Math.cos(alpha * Math.PI / 180) * scale;
+
+function updateDiagram() {
+const theta = parseFloat(slider.value);
+angleValueSpan.textContent = theta + '°';
+
+// Calculate sword tip position
+const armAngleFromHorizontal = 90 - alpha - theta;
+const tipX = shoulderX + L * Math.cos(armAngleFromHorizontal * Math.PI / 180) * scale;
+const tipY = shoulderY + L * Math.sin(armAngleFromHorizontal * Math.PI / 180) * scale;
+
+// Calculate total reach
+const reach = t * Math.sin(alpha * Math.PI / 180) + L * Math.sin((alpha + theta) * Math.PI / 180);
+reachValueSpan.textContent = reach.toFixed(1) + ' cm';
+
+// Update SVG elements
+armSegment.setAttribute('x2', tipX);
+armSegment.setAttribute('y2', tipY);
+swordTip.setAttribute('cx', tipX);
+swordTip.setAttribute('cy', tipY);
+reachLine.setAttribute('x2', 60 + reach * scale);
+armHorizontal.setAttribute('x2', 60 + reach * scale);
+
+// Update angle arc
+const arcEndX = shoulderX + 18 * Math.cos((90 - theta) * Math.PI / 180);
+const arcEndY = shoulderY - 18 * Math.sin((90 - theta) * Math.PI / 180);
+const arcPath = `M ${shoulderX} ${shoulderY - 18} A 18 18 0 0 1 ${arcEndX} ${arcEndY}`;
+angleArc.setAttribute('d', arcPath);
+
+// Update angle text position
+angleText.setAttribute('x', arcEndX + 5);
+angleText.setAttribute('y', arcEndY - 5);
+
+// Update right angle indicator
+const rightAngleX = 60 + reach * scale;
+rightAngle.setAttribute('d', `M ${rightAngleX - 10} ${tipY} L ${rightAngleX - 10} 350 L ${rightAngleX} 350`);
+}
+
+// Download function
+function downloadHTML() {
+const htmlContent = document.documentElement.outerHTML;
+const blob = new Blob([htmlContent], { type: 'text/html' });
+const url = URL.createObjectURL(blob);
+const a = document.createElement('a');
+a.href = url;
+a.download = 'fencing-interactive-model2.html';
+document.body.appendChild(a);
+a.click();
+document.body.removeChild(a);
+URL.revokeObjectURL(url);
+}
+
+slider.addEventListener('input', updateDiagram);
+updateDiagram(); // Initialize
+</script>
+
+</body></html>
